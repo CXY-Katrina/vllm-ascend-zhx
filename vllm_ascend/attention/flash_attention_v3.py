@@ -36,6 +36,7 @@ class AscendFlashAttentionBackend(AscendAttentionBackend):
 class AscendFlashAttentionMetadata(AscendMetadata):
     # Shared only within this execution, keyed by the operator's static parameters.
     scheduler_metadata: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    varlen_scheduler_metadata: dict[tuple, torch.Tensor] = field(default_factory=dict)
 
 
 class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAttentionMetadata]):
@@ -118,6 +119,29 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         graph_shape = num_input_tokens in self.capture_sizes
         max_query_len = num_input_tokens if graph_shape else common.max_query_len
         scheduler_metadata = {}
+        varlen_scheduler_metadata = {}
+        if common.attn_state == AscendAttentionState.PrefillNoCache:
+            # Varlen consumes only the current packed K/V. Prepare its tiling
+            # once per layer layout, including warmups for capturable shapes.
+            varlen_kv_lens = query_start_loc[1:] - query_start_loc[:-1]
+            for spec in self.scheduler_specs:
+                num_heads, num_kv_heads, head_size, dtype, scale, softcap = spec
+                varlen_scheduler_metadata[spec] = get_scheduler_metadata(
+                    batch_size=self.max_num_reqs,
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_k=max_query_len,
+                    num_heads_q=num_heads,
+                    num_heads_kv=num_kv_heads,
+                    headdim=head_size,
+                    cache_seqlens=varlen_kv_lens,
+                    qkv_dtype=dtype,
+                    cu_seqlens_q=query_start_loc,
+                    page_size=None,
+                    causal=common.causal,
+                    softmax_scale=scale,
+                    softcap=softcap,
+                    num_splits=1,
+                )
         needs_paged_attention = graph_shape or common.attn_state != AscendAttentionState.PrefillNoCache
         for spec in self.scheduler_specs if needs_paged_attention else ():
             num_heads, num_kv_heads, head_size, dtype, scale, softcap = spec
@@ -160,6 +184,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
             causal=common.causal,
             model_runner_type=self.model_runner_type,
             scheduler_metadata=scheduler_metadata,
+            varlen_scheduler_metadata=varlen_scheduler_metadata,
         )
 
     def build_for_graph_capture(
@@ -229,6 +254,14 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         record_attention_compute_start()
         max_query_len = attn_metadata.max_query_len
+        scheduler_key = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            query.dtype,
+            self.scale,
+            self.logits_soft_cap,
+        )
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache and not _EXTRA_CTX.capturing:
             num_tokens = attn_metadata.num_actual_tokens
             result = flash_attn_varlen_func(
@@ -242,19 +275,12 @@ class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
                 softcap=self.logits_soft_cap,
+                scheduler_metadata=attn_metadata.varlen_scheduler_metadata[scheduler_key],
                 num_splits=1,
             )
             output[:num_tokens].copy_(result)
             return output
 
-        scheduler_key = (
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            query.dtype,
-            self.scale,
-            self.logits_soft_cap,
-        )
         result = flash_attn_with_kvcache(
             query,
             self.key_cache,

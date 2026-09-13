@@ -129,6 +129,7 @@ def test_paged_call_keeps_causal_multi_token_queries(builder, impl, state):
 def test_varlen_only_for_uncached_prefill(builder, impl):
     metadata = builder.build(0, common_metadata([3, 7], [3, 7]))
     metadata.attn_state = AscendAttentionState.PrefillNoCache
+    metadata.varlen_scheduler_metadata[(4, 2, 8, torch.float32, 0.123, 0.0)] = torch.empty(1)
     query = torch.randn(12, 4, 8)
     output = torch.full_like(query, -1)
     with (
@@ -161,6 +162,7 @@ def test_full_forward_never_falls_back_to_fia(builder, impl, state, capturing):
     metadata = builder.build(0, common_metadata(query_lens, [10, 20]))
     metadata.attn_state = state
     metadata.scheduler_metadata[(4, 2, 8, torch.float32, 0.123, 0.0)] = torch.empty(1)
+    metadata.varlen_scheduler_metadata[(4, 2, 8, torch.float32, 0.123, 0.0)] = torch.empty(1)
     query = torch.randn(sum(query_lens), 4, 8)
     output = torch.empty_like(query)
     expected = torch.full_like(query, 7)
@@ -274,3 +276,31 @@ def test_config_rejects_context_parallel_fa3(pcp, dcp):
     )
     with pytest.raises(ValueError, match="FA3 context parallelism"):
         config.derive_and_validate(vllm_config)
+
+
+def test_varlen_tiling_shared_but_attention_computed_for_each_layer(builder, impl):
+    spec = (4, 2, 8, torch.float32, 0.123, 0.0)
+    builder.scheduler_specs = {spec}
+    common = common_metadata([3, 7], [3, 7])
+    common.attn_state = AscendAttentionState.PrefillNoCache
+    shared_tiling = torch.tensor([1], dtype=torch.uint8)
+    query = torch.randn(10, 4, 8)
+    output = torch.empty_like(query)
+    with (
+        patch.object(fa3, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch.object(fa3, "get_scheduler_metadata", return_value=shared_tiling) as tiling,
+        patch.object(fa3, "flash_attn_varlen_func", side_effect=[query, query + 1]) as kernel,
+        patch.object(fa3, "record_attention_compute_start"),
+    ):
+        metadata = builder.build(0, common)
+        impl.forward_impl(query, query, query, (), metadata, output)
+        assert output.equal(query)
+        impl.forward_impl(query + 1, query + 1, query + 1, (), metadata, output)
+        assert output.equal(query + 1)
+    tiling.assert_called_once()
+    assert tiling.call_args.kwargs["page_size"] is None
+    assert tiling.call_args.kwargs["max_seqlen_k"] == 7
+    assert tiling.call_args.kwargs["cache_seqlens"].tolist() == [3, 7, 0, 0, 0]
+    assert kernel.call_count == 2
+    assert all(call.kwargs["scheduler_metadata"] is shared_tiling for call in kernel.call_args_list)
+    assert not metadata.scheduler_metadata
